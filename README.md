@@ -25,6 +25,14 @@ python app.py
 
 3. 開啟瀏覽器訪問：http://localhost:5000
 
+停止服務時，回到執行中的終端機按 `Ctrl+C`。
+
+### 執行設定
+
+- JSON 資料固定儲存在專案 `data` 目錄，不受目前終端機所在路徑影響。
+- Flask Secret Key 預設於啟動時隨機產生。需要跨重啟維持 session 時，請設定 `FLASK_SECRET_KEY` 環境變數。
+- Debug 預設關閉；本機除錯時可設定 `FLASK_DEBUG=1` 後啟動。
+
 ## 技術架構
 
 - 後端：Python Flask

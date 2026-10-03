@@ -1,18 +1,23 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 import json
 import os
+import secrets
+import tempfile
+from copy import deepcopy
 from datetime import datetime
+from pathlib import Path
 import uuid
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-here'
+app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
+app.config['DEBUG'] = os.environ.get('FLASK_DEBUG', '').lower() in {'1', 'true', 'yes'}
 
 # 資料儲存路徑
-DATA_DIR = 'data'
-PRODUCTS_FILE = os.path.join(DATA_DIR, 'products.json')
-LOCATIONS_FILE = os.path.join(DATA_DIR, 'locations.json')
-STOCKS_FILE = os.path.join(DATA_DIR, 'stocks.json')
-TRANSACTIONS_FILE = os.path.join(DATA_DIR, 'transactions.json')
+DATA_DIR = Path(__file__).resolve().parent / 'data'
+PRODUCTS_FILE = DATA_DIR / 'products.json'
+LOCATIONS_FILE = DATA_DIR / 'locations.json'
+STOCKS_FILE = DATA_DIR / 'stocks.json'
+TRANSACTIONS_FILE = DATA_DIR / 'transactions.json'
 
 # 記憶體資料結構
 products = {}  # {"P001": {"name": "商品A", "barcode": "1234567890", "unit": "箱", "category": "食品"}}
@@ -23,51 +28,97 @@ transactions = []  # 交易歷史記錄
 def load_data():
     """從 JSON 檔案載入資料"""
     global products, locations, stocks, transactions
-    
+    loaded_products = _load_json(PRODUCTS_FILE, {})
+    loaded_locations = _load_json(LOCATIONS_FILE, {})
+    stocks_data = _load_json(STOCKS_FILE, {})
+    loaded_transactions = _load_json(TRANSACTIONS_FILE, [])
+
     try:
-        if os.path.exists(PRODUCTS_FILE):
-            with open(PRODUCTS_FILE, 'r', encoding='utf-8') as f:
-                products = json.load(f)
-        
-        if os.path.exists(LOCATIONS_FILE):
-            with open(LOCATIONS_FILE, 'r', encoding='utf-8') as f:
-                locations = json.load(f)
-        
-        if os.path.exists(STOCKS_FILE):
-            with open(STOCKS_FILE, 'r', encoding='utf-8') as f:
-                # 將字串 key 轉換回 tuple
-                stocks_data = json.load(f)
-                stocks = {tuple(k.split(',')): v for k, v in stocks_data.items()}
-        
-        if os.path.exists(TRANSACTIONS_FILE):
-            with open(TRANSACTIONS_FILE, 'r', encoding='utf-8') as f:
-                transactions = json.load(f)
-    except Exception as e:
-        print(f"載入資料時發生錯誤: {e}")
-        # 如果載入失敗，使用預設資料
-        init_default_data()
+        loaded_stocks = {}
+        for key, quantity in stocks_data.items():
+            stock_key = tuple(key.split(','))
+            if len(stock_key) != 2 or not isinstance(quantity, int) or quantity < 0:
+                raise ValueError(f'無效的庫存資料：{key}')
+            loaded_stocks[stock_key] = quantity
+    except (AttributeError, TypeError) as error:
+        raise ValueError('庫存 JSON 格式無效') from error
+
+    if not isinstance(loaded_products, dict) or not isinstance(loaded_locations, dict) or not isinstance(loaded_transactions, list):
+        raise ValueError('商品、儲位或交易 JSON 格式無效')
+
+    products = loaded_products
+    locations = loaded_locations
+    stocks = loaded_stocks
+    transactions = loaded_transactions
+
+
+def _load_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        with path.open('r', encoding='utf-8') as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f'無法載入資料檔 {path.name}，請先檢查或復原檔案') from error
 
 def save_data():
     """儲存資料到 JSON 檔案"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payloads = {
+        PRODUCTS_FILE: products,
+        LOCATIONS_FILE: locations,
+        STOCKS_FILE: {','.join(key): quantity for key, quantity in stocks.items()},
+        TRANSACTIONS_FILE: transactions,
+    }
+    temporary_files = {}
     try:
-        # 確保資料目錄存在
-        os.makedirs(DATA_DIR, exist_ok=True)
-        
-        with open(PRODUCTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(products, f, ensure_ascii=False, indent=2)
-        
-        with open(LOCATIONS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(locations, f, ensure_ascii=False, indent=2)
-        
-        # stocks 的 key 是 tuple，需要轉換為字串
-        stocks_data = {','.join(k): v for k, v in stocks.items()}
-        with open(STOCKS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(stocks_data, f, ensure_ascii=False, indent=2)
-        
-        with open(TRANSACTIONS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(transactions, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"儲存資料時發生錯誤: {e}")
+        for path, payload in payloads.items():
+            with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=DATA_DIR, delete=False) as file:
+                temporary_files[path] = Path(file.name)
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+        for path, temporary_path in temporary_files.items():
+            os.replace(temporary_path, path)
+    finally:
+        for temporary_path in temporary_files.values():
+            temporary_path.unlink(missing_ok=True)
+
+
+def snapshot_data():
+    return deepcopy((products, locations, stocks, transactions))
+
+
+def persist_or_rollback(snapshot):
+    global products, locations, stocks, transactions
+    try:
+        save_data()
+    except (OSError, TypeError, ValueError):
+        products, locations, stocks, transactions = snapshot
+        app.logger.exception('儲存資料失敗，已還原本次記憶體變更')
+        flash('資料儲存失敗，操作未完成，請檢查伺服器資料目錄。', 'error')
+        return False
+    return True
+
+
+def parse_quantity(field_name, allow_zero=False):
+    """驗證使用者輸入的非負或正整數數量。"""
+    raw_value = request.form.get(field_name, '')
+    try:
+        quantity = int(raw_value)
+    except (TypeError, ValueError):
+        raise ValueError('數量必須是整數。') from None
+    if quantity < 0 or (quantity == 0 and not allow_zero):
+        raise ValueError('數量必須大於零。' if not allow_zero else '數量不可為負數。')
+    return quantity
+
+
+def quantity_or_redirect(field_name, endpoint, allow_zero=False):
+    try:
+        return parse_quantity(field_name, allow_zero=allow_zero)
+    except ValueError as error:
+        flash(str(error), 'error')
+        return redirect(url_for(endpoint))
 
 def init_default_data():
     """初始化預設資料"""
@@ -129,7 +180,6 @@ def add_transaction(trans_type, product_id, location_id, quantity):
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     transactions.append(transaction)
-    save_data()
 
 # 路由定義
 @app.route('/')
@@ -176,6 +226,7 @@ def products_add():
                 flash('條碼已存在！', 'error')
                 return render_template('product_form.html', action='add')
         
+        snapshot = snapshot_data()
         product_id = get_next_id('P', products)
         products[product_id] = {
             'name': name,
@@ -183,7 +234,8 @@ def products_add():
             'unit': unit,
             'category': category
         }
-        save_data()
+        if not persist_or_rollback(snapshot):
+            return redirect(url_for('products_add'))
         flash('商品新增成功！', 'success')
         return redirect(url_for('products_list'))
     
@@ -208,19 +260,21 @@ def products_edit(product_id):
                 flash('條碼已存在！', 'error')
                 return render_template('product_form.html', action='edit', product_id=product_id, product=products[product_id])
         
+        snapshot = snapshot_data()
         products[product_id] = {
             'name': name,
             'barcode': barcode,
             'unit': unit,
             'category': category
         }
-        save_data()
+        if not persist_or_rollback(snapshot):
+            return redirect(url_for('products_edit', product_id=product_id))
         flash('商品更新成功！', 'success')
         return redirect(url_for('products_list'))
     
     return render_template('product_form.html', action='edit', product_id=product_id, product=products[product_id])
 
-@app.route('/products/delete/<product_id>')
+@app.route('/products/delete/<product_id>', methods=['POST'])
 def products_delete(product_id):
     """刪除商品"""
     if product_id not in products:
@@ -234,8 +288,10 @@ def products_delete(product_id):
     if has_stock or has_transactions:
         flash('該商品已有庫存或交易記錄，無法刪除！', 'error')
     else:
+        snapshot = snapshot_data()
         del products[product_id]
-        save_data()
+        if not persist_or_rollback(snapshot):
+            return redirect(url_for('products_list'))
         flash('商品刪除成功！', 'success')
     
     return redirect(url_for('products_list'))
@@ -250,11 +306,13 @@ def locations_list():
 def locations_add():
     """新增儲位"""
     if request.method == 'POST':
+        snapshot = snapshot_data()
         desc = request.form['desc']
         
         location_id = get_next_id('L', locations)
         locations[location_id] = {'desc': desc}
-        save_data()
+        if not persist_or_rollback(snapshot):
+            return redirect(url_for('locations_add'))
         flash('儲位新增成功！', 'success')
         return redirect(url_for('locations_list'))
     
@@ -268,15 +326,17 @@ def locations_edit(location_id):
         return redirect(url_for('locations_list'))
     
     if request.method == 'POST':
+        snapshot = snapshot_data()
         desc = request.form['desc']
         locations[location_id] = {'desc': desc}
-        save_data()
+        if not persist_or_rollback(snapshot):
+            return redirect(url_for('locations_edit', location_id=location_id))
         flash('儲位更新成功！', 'success')
         return redirect(url_for('locations_list'))
     
     return render_template('location_form.html', action='edit', location_id=location_id, location=locations[location_id])
 
-@app.route('/locations/delete/<location_id>')
+@app.route('/locations/delete/<location_id>', methods=['POST'])
 def locations_delete(location_id):
     """刪除儲位"""
     if location_id not in locations:
@@ -290,8 +350,10 @@ def locations_delete(location_id):
     if has_stock or has_transactions:
         flash('該儲位已有庫存或交易記錄，無法刪除！', 'error')
     else:
+        snapshot = snapshot_data()
         del locations[location_id]
-        save_data()
+        if not persist_or_rollback(snapshot):
+            return redirect(url_for('locations_list'))
         flash('儲位刪除成功！', 'success')
     
     return redirect(url_for('locations_list'))
@@ -307,7 +369,9 @@ def inbound_submit():
     """提交入庫"""
     product_id = request.form['product_id']
     location_id = request.form['location_id']
-    quantity = int(request.form['quantity'])
+    quantity = quantity_or_redirect('quantity', 'inbound')
+    if not isinstance(quantity, int):
+        return quantity
     
     if product_id not in products:
         flash('商品不存在！', 'error')
@@ -317,6 +381,7 @@ def inbound_submit():
         flash('儲位不存在！', 'error')
         return redirect(url_for('inbound'))
     
+    snapshot = snapshot_data()
     # 更新庫存
     stock_key = (product_id, location_id)
     if stock_key in stocks:
@@ -326,6 +391,8 @@ def inbound_submit():
     
     # 新增交易記錄
     add_transaction('入庫', product_id, location_id, quantity)
+    if not persist_or_rollback(snapshot):
+        return redirect(url_for('inbound'))
     
     flash(f'入庫成功！{products[product_id]["name"]} 在 {locations[location_id]["desc"]} 增加 {quantity} {products[product_id]["unit"]}', 'success')
     return redirect(url_for('inbound'))
@@ -341,7 +408,9 @@ def outbound_submit():
     """提交出庫"""
     product_id = request.form['product_id']
     location_id = request.form['location_id']
-    quantity = int(request.form['quantity'])
+    quantity = quantity_or_redirect('quantity', 'outbound')
+    if not isinstance(quantity, int):
+        return quantity
     
     if product_id not in products:
         flash('商品不存在！', 'error')
@@ -359,11 +428,14 @@ def outbound_submit():
         flash(f'庫存不足！目前庫存：{current_stock} {products[product_id]["unit"]}', 'error')
         return redirect(url_for('outbound'))
     
+    snapshot = snapshot_data()
     # 更新庫存
     stocks[stock_key] -= quantity
     
     # 新增交易記錄
     add_transaction('出庫', product_id, location_id, quantity)
+    if not persist_or_rollback(snapshot):
+        return redirect(url_for('outbound'))
     
     flash(f'出庫成功！{products[product_id]["name"]} 從 {locations[location_id]["desc"]} 減少 {quantity} {products[product_id]["unit"]}', 'success')
     return redirect(url_for('outbound'))
@@ -374,6 +446,8 @@ def inventory():
     """庫存查詢"""
     query = request.args.get('query', '')
     filter_type = request.args.get('filter', 'all')
+    if filter_type not in {'all', 'has_stock', 'zero_stock', 'low_stock'}:
+        filter_type = 'all'
     
     # 建立庫存清單
     inventory_list = []
@@ -398,7 +472,7 @@ def inventory():
                     continue
             
             # 庫存過濾
-            if filter_type == 'low_stock' and quantity > 0:
+            if filter_type == 'low_stock' and not 0 < quantity <= 10:
                 continue
             elif filter_type == 'zero_stock' and quantity != 0:
                 continue
@@ -420,7 +494,9 @@ def stocktaking_submit():
     """提交盤點"""
     product_id = request.form['product_id']
     location_id = request.form['location_id']
-    actual_quantity = int(request.form['actual_quantity'])
+    actual_quantity = quantity_or_redirect('actual_quantity', 'stocktaking', allow_zero=True)
+    if not isinstance(actual_quantity, int):
+        return actual_quantity
     
     if product_id not in products:
         flash('商品不存在！', 'error')
@@ -430,6 +506,7 @@ def stocktaking_submit():
         flash('儲位不存在！', 'error')
         return redirect(url_for('stocktaking'))
     
+    snapshot = snapshot_data()
     stock_key = (product_id, location_id)
     system_quantity = stocks.get(stock_key, 0)
     difference = actual_quantity - system_quantity
@@ -439,6 +516,8 @@ def stocktaking_submit():
     
     # 新增交易記錄
     add_transaction('盤點', product_id, location_id, difference)
+    if not persist_or_rollback(snapshot):
+        return redirect(url_for('stocktaking'))
     
     flash(f'盤點完成！{products[product_id]["name"]} 在 {locations[location_id]["desc"]}：系統數量 {system_quantity}，實際數量 {actual_quantity}，差異 {difference:+d}', 'success')
     return redirect(url_for('stocktaking'))
@@ -470,4 +549,4 @@ if __name__ == '__main__':
         init_default_data()
         save_data()
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=app.config['DEBUG'], host='0.0.0.0', port=5000)
